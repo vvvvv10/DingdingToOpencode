@@ -8,6 +8,10 @@
     "node": ">=20.11"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "install:launchd": "zsh scripts/install-launchd.sh",
+    "uninstall:launchd": "zsh scripts/install-launchd.sh --uninstall",
     "probe": "tsx scripts/p0-probe.ts",
     "probe:dingtalk": "tsx scripts/p0-dingtalk.ts",
     "diag": "tsx scripts/diag-session.ts",

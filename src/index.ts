@@ -9,6 +9,9 @@
  * (src/opencode/timeline.ts); the global event stream is only a latency
  * trigger. See docs/design.md §5.5.
  */
+import { execFile } from "node:child_process"
+import { accessSync, constants } from "node:fs"
+import { join } from "node:path"
 import "./polyfills.js"
 import { OpenCode } from "@opencode/client"
 import { loadConfig, type BridgeConfig, type ProjectConfig } from "./config.js"
@@ -21,6 +24,10 @@ import { DingTalkSenderImpl, type SendTarget } from "./dingtalk/send.js"
 import { Outbox } from "./outbox.js"
 import { showApprovalDialog } from "./approvals/mac-dialog.js"
 import { resolvePermissions } from "./permissions.js"
+import { checkAdmission } from "./limits.js"
+import { applyRetention } from "./store/retention.js"
+import { acquireInstanceLock, type InstanceLock } from "./runtime/lock.js"
+import { HeartbeatWriter, heartbeatPath } from "./runtime/heartbeat.js"
 import { audit, openDatabase, type Db } from "./store/db.js"
 import {
   getConversation,
@@ -64,6 +71,10 @@ class Bridge {
   private permissionsSynced = new Set<string>()
   /** taskId -> last heartbeat notification. */
   private heartbeatAt = new Map<string, number>()
+  /** single-instance lock, released on shutdown */
+  private instanceLock: InstanceLock | undefined
+  /** local health probe file */
+  private heartbeat: HeartbeatWriter | undefined
 
   constructor(
     private readonly config: BridgeConfig,
@@ -95,6 +106,12 @@ class Bridge {
   async start(): Promise<void> {
     this.running = true
     clearExpiredLocks(this.db)
+
+    // Single instance (design §11.4): a second bridge would double-dispatch
+    // tasks and fight over the outbox.
+    this.instanceLock = acquireInstanceLock(`${this.config.bridge.dataDir}/runtime`)
+    this.heartbeat = new HeartbeatWriter(heartbeatPath(this.config.bridge.dataDir))
+
     await this.connectOpenCode()
     await this.adapter.connect()
     void this.watchGlobalEvents()
@@ -102,16 +119,20 @@ class Bridge {
     log.info("bridge.started", {
       projects: this.config.projects.map((project) => project.alias),
       opencode: this.openCodeVersion,
+      lock: this.instanceLock.path,
     })
   }
 
   async stop(): Promise<void> {
     this.running = false
     this.adapter.disconnect()
+    this.instanceLock?.release()
+    this.instanceLock = undefined
     log.info("bridge.stopped")
   }
 
   private async connectOpenCode(): Promise<void> {
+    let attempts = 0
     for (;;) {
       try {
         const connection = await connectOpenCode({
@@ -121,17 +142,59 @@ class Bridge {
         })
         this.client = connection.client
         this.openCodeVersion = connection.version
+        attempts = 0
         return
       } catch (error) {
         const reason =
           error instanceof OpenCodeUnavailableError ? error.reason : "unknown"
         this.client = undefined
         log.warn("opencode.unavailable", { reason, error: (error as Error).message })
+
+        // Bring up the SHARED service so a headless machine (no TUI) still
+        // works. `opencode service start` registers the one shared instance.
+        if (
+          this.config.opencode.autoStartService &&
+          reason === "not_running" &&
+          ++attempts >= 2
+        ) {
+          attempts = 0
+          await this.startOpenCodeService()
+        }
+
         // Keep serving DingTalk: commands still work, tasks are rejected with a
         // clear message. The service may come back at any time.
         await sleep(10_000)
       }
     }
+  }
+
+  private async startOpenCodeService(): Promise<void> {
+    const binary = await this.resolveOpenCodeBinary()
+    if (!binary) {
+      log.warn("opencode.autostart.unavailable", { reason: "binary not found" })
+      return
+    }
+    log.info("opencode.autostart", { binary })
+    try {
+      await execFile(binary, ["service", "start"], { timeout: 30_000 })
+      log.info("opencode.autostart.done")
+    } catch (error) {
+      log.warn("opencode.autostart.failed", { error: (error as Error).message })
+    }
+  }
+
+  private async resolveOpenCodeBinary(): Promise<string | undefined> {
+    for (const dir of (process.env.PATH ?? "").split(":")) {
+      if (!dir) continue
+      const candidate = join(dir, "opencode")
+      try {
+        accessSync(candidate, constants.X_OK)
+        return candidate
+      } catch {
+        // keep looking
+      }
+    }
+    return undefined
   }
 
   // ------------------------------------------------------------- message flow
@@ -144,6 +207,8 @@ class Bridge {
     if (message.conversationType === "2" && !message.isInAtList) {
       return
     }
+
+    this.heartbeat?.update({ lastDingTalkMessageAt: Date.now() })
 
     const route = this.resolveRoute(message)
     if (!route.ok) {
@@ -206,6 +271,18 @@ class Bridge {
     if (!this.client) {
       recordInbound(this.db, message.msgId, "REJECTED", "opencode_unavailable")
       await this.replyDirect(message, "⚠️ 本机 OpenCode 未运行，任务未提交。")
+      return
+    }
+
+    const admission = checkAdmission(this.db, {
+      conversationId: message.conversationId,
+      senderStaffId: message.senderStaffId,
+      maxQueuePerSession: this.config.bridge.maxQueuePerSession,
+      maxTasksPerUserPerHour: this.config.bridge.maxTasksPerUserPerHour,
+    })
+    if (!admission.ok) {
+      recordInbound(this.db, message.msgId, "REJECTED", admission.code)
+      await this.replyDirect(message, admission.message)
       return
     }
 
@@ -565,6 +642,20 @@ class Bridge {
       const conversation = getConversation(this.db, task.conversation_id)
       if (!conversation) continue
 
+      // The conversation was rebound to another project (config change):
+      // the old session still points at the previous directory, so drop it.
+      if (conversation.project_alias !== project.alias) {
+        log.info("conversation.rebound", {
+          conversationId: task.conversation_id,
+          from: conversation.project_alias,
+          to: project.alias,
+        })
+        this.db
+          .prepare("UPDATE conversations SET project_alias = ?, active_session_id = NULL WHERE conversation_id = ?")
+          .run(project.alias, task.conversation_id)
+        continue
+      }
+
       let sessionId = conversation.active_session_id ?? undefined
       if (sessionId) {
         const active = sessionTask(this.db, sessionId)
@@ -752,6 +843,7 @@ class Bridge {
         outcome: turn.outcome,
         durationSeconds: duration,
       })
+      this.heartbeat?.update({ lastTaskFinishedAt: Date.now() })
     }
   }
 
@@ -1050,6 +1142,7 @@ class Bridge {
             type === "session.execution.failed" ||
             type === "session.idle"
           ) {
+            this.heartbeat?.update({ lastOpenCodeEventAt: Date.now() })
             void this.reconcile()
           }
         }
@@ -1091,6 +1184,11 @@ class Bridge {
         await this.schedule()
         if (tick % 2 === 0) await this.reconcile()
         if (tick % 5 === 0) await this.expireApprovals()
+        if (tick % 3600 === 0 && tick > 0) {
+          const purged = applyRetention(this.db)
+          log.info("retention.applied", { ...purged })
+        }
+        if (tick % 5 === 0) this.writeHeartbeat()
         if (tick % 30 === 0 && this.outbox.pendingCount() > 0) {
           log.warn("outbox.backlog", { pending: this.outbox.pendingCount() })
         }
@@ -1100,6 +1198,19 @@ class Bridge {
       tick += 1
       await sleep(1000)
     }
+  }
+
+  /** Refresh the local health probe file (design §13.3). */
+  private writeHeartbeat(): void {
+    if (!this.heartbeat) return
+    const active = activeTasks(this.db)
+    this.heartbeat.update({
+      opencodeVersion: this.openCodeVersion,
+      opencodeAvailable: Boolean(this.client),
+      dingtalkConnected: this.adapter.isConnected,
+      queueDepth: active.filter((task) => task.status === "PENDING").length,
+      activeTasks: active.filter((task) => task.status !== "PENDING").length,
+    })
   }
 }
 

@@ -967,11 +967,25 @@ CREATE INDEX idx_audit_ts ON audit_log(ts);
   3. `opencode service status` / `opencode api get /api/info`。
 - 提供 `bridge status` 本地 CLI 读取上述文件。
 
-### 13.4 部署（launchd）
+### 13.4 部署（launchd LaunchAgent）
 
-- LaunchAgent `com.example.opencode-dingtalk-bridge`：`RunAtLoad`、`KeepAlive`、`WorkingDirectory`、日志路径、`EnvironmentVariables` 含 `NO_PROXY=localhost,127.0.0.1,::1`。
-- 启动顺序：OpenCode 共享服务（`opencode service start` 或用户开 TUI）→ bridge。bridge 不负责前者。
-- 升级：先停 bridge → 升级 OpenCode/客户端 → 跑契约自检 → 起 bridge。契约自检失败时保持旧版本运行。
+已实现：`scripts/install-launchd.sh`（`npm run install:launchd` / `npm run uninstall:launchd`）。
+
+- Label：`com.opencode.dingtalk-bridge`，安装到 `~/Library/LaunchAgents/`。
+- `ProgramArguments`：`<node绝对路径> <项目>/dist/index.js`（先 `npm run build` 产出 `dist/`，运行时不依赖 tsx）。
+- `WorkingDirectory`：项目根；`EnvironmentVariables` 写入 `PATH`（含 nvm 的 node/bin 目录，保证能解析到 `opencode`）与 `NO_PROXY=localhost,127.0.0.1,::1`。
+- `RunAtLoad` + `KeepAlive`（`ThrottleInterval=15`，避免配置错误时疯狂重启）。
+- 日志：`~/Library/Logs/com.opencode-dingtalk-bridge/{out,error}.log`。
+- **开机后 OpenCode 服务可能还没起来**：桥接在连续 2 次发现失败后执行 `opencode service start` —— 这是**共享**服务（`opencode.autoStartService`，默认 true），不是第二个私有实例；TUI 之后启动会复用它。
+- 桥接自身有单实例文件锁（`src/runtime/lock.ts`），launchd 重启与手工启动不会并存。
+
+常用命令：
+
+```sh
+launchctl print gui/$(id -u)/com.opencode.dingtalk-bridge
+launchctl kickstart -k gui/$(id -u)/com.opencode.dingtalk-bridge
+launchctl bootout   gui/$(id -u)/com.opencode.dingtalk-bridge
+```
 
 ---
 
@@ -989,9 +1003,21 @@ CREATE INDEX idx_audit_ts ON audit_log(ts);
   },
   "opencode": {
     "versionRange": ">=2.0.18 <2.1.0",
-    "requiredOperations": [
-      "session.create", "session.prompt", "session.inbox.cancel",
-      "session.interrupt", "session.log", "permission.reply", "form.cancel"
+    "autoStartService": true,
+    "requiredRoutes": [
+      "POST /api/session",
+      "GET /api/session/{sessionID}",
+      "GET /api/session/active",
+      "POST /api/session/{sessionID}/prompt",
+      "GET /api/session/{sessionID}/inbox",
+      "DELETE /api/session/{sessionID}/inbox/{inboxID}",
+      "GET /api/experimental/session/{sessionID}/log",
+      "POST /api/session/{sessionID}/interrupt",
+      "GET /api/session/{sessionID}/permission",
+      "POST /api/session/{sessionID}/permission/{requestID}/reply",
+      "GET /api/session/{sessionID}/form",
+      "POST /api/session/{sessionID}/form/{formID}/reply",
+      "DELETE /api/session/{sessionID}/form/{formID}"
     ]
   },
   "bridge": {
@@ -1010,6 +1036,7 @@ CREATE INDEX idx_audit_ts ON audit_log(ts);
       "alias": "my-app",
       "directory": "~/code/my-app",
       "agent": "dingtalk",
+      "permissionPreset": "default",
       "allowedConversations": ["cidxxxxxxxxxxxxxx=="],
       "allowedUsers": ["012345678901234567"],
       "approvers": ["012345678901234567"],

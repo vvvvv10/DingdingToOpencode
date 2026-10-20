@@ -30,6 +30,14 @@ const Config = z.object({
   opencode: z.object({
     versionRange: z.string().default(">=2.0.18 <2.1.0"),
     /**
+     * Start the SHARED local service when it is not running.
+     *
+     * This is `opencode service start` — the same service the TUI uses, not a
+     * second private instance. Without it the bridge would stay idle after a
+     * reboot until somebody opens the TUI.
+     */
+    autoStartService: z.boolean().default(true),
+    /**
      * Contract check by "METHOD /path". operationIds are renamed between
      * OpenCode releases while routes stay stable, so routes are the contract.
      */
