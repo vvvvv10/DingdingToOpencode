@@ -278,8 +278,10 @@ export class Bridge {
         await this.replyDirect(message, "只读问答已关闭。")
         return
       }
-      await this.replyDirect(message, "🤔 思考中…")
-      void this.runAsk(message, project, body)
+      // A question is a task of kind "ask": it goes through the same durable
+      // pipeline (task row -> timeline -> outbox), so the answer still arrives
+      // if the bridge restarts mid-answer.
+      await this.startTask(message, project, body, "ask")
       return
     }
 
@@ -314,6 +316,7 @@ export class Bridge {
     message: DingTalkInbound,
     project: ProjectConfig,
     text: string,
+    kind: "task" | "ask" = "task",
   ): Promise<void> {
     if (text.length > this.opts.config.bridge.maxPromptChars) {
       markInboundRejected(this.db, message.msgId, "prompt_too_long")
@@ -363,6 +366,7 @@ export class Bridge {
       senderStaffId: message.senderStaffId,
       projectAlias: project.alias,
       promptText: text,
+      kind,
     })
 
     audit(this.db, {
@@ -380,7 +384,10 @@ export class Bridge {
       taskId: task.task_id,
       conversationId: message.conversationId,
       kind: "STATUS",
-      text: `✅ 已接收（任务 ${task.task_id}）\n项目：${project.alias}\n状态：排队中`,
+      text:
+        kind === "ask"
+          ? `🤔 思考中…（${task.task_id}）`
+          : `✅ 已接收（任务 ${task.task_id}）\n项目：${project.alias}\n状态：排队中`,
     })
 
     await this.schedule()
@@ -552,49 +559,6 @@ export class Bridge {
       result: "OK",
     })
     return { ok: true, message: "ok" }
-  }
-
-  /**
-   * Read-only question answering on a dedicated session.
-   *
-   * The chat session uses a read-only agent and never touches the task
-   * session's context.
-   */
-  private async runAsk(
-    message: DingTalkInbound,
-    project: ProjectConfig,
-    question: string,
-  ): Promise<void> {
-    if (!this.client) {
-      await this.replyDirect(message, "⚠️ 本机 OpenCode 未运行。")
-      return
-    }
-    const sessionId = await this.ensureChatSession(message.conversationId, project)
-    if (!sessionId) {
-      await this.replyDirect(message, "⚠️ 无法创建只读会话。")
-      return
-    }
-    try {
-      const inbox = await this.client.session.prompt({
-        sessionID: sessionId,
-        text: question,
-        delivery: "queue",
-        metadata: { source: "dingtalk-ask", conversationID: message.conversationId },
-      })
-      const turn = await waitForTurn(this.client, sessionId, inbox.id, { timeoutMs: 180_000 })
-      if (!turn) {
-        await this.replyDirect(message, "⌛ 回答超时，请重试。")
-        return
-      }
-      const text = (turn.text || "<无输出>").slice(0, this.opts.config.bridge.maxResultChars)
-      await this.replyDirect(
-        message,
-        turn.outcome === "succeeded" ? text : `❌ 问答失败（${turn.outcome}）\n${text}`,
-      )
-    } catch (error) {
-      log.error("ask.failed", { error: (error as Error).message })
-      await this.replyDirect(message, "❌ 问答失败。")
-    }
   }
 
   private async ensureChatSession(
@@ -827,6 +791,50 @@ export class Bridge {
       const conversation = getConversation(this.db, task.conversation_id)
       if (!conversation) continue
 
+      if (task.kind === "ask") {
+        // Read-only question: own session, no project lock (it changes
+        // nothing), no summary suffix.
+        const chatSessionId = await this.ensureChatSession(task.conversation_id, project)
+        if (!chatSessionId) continue
+        if (sessionTask(this.db, chatSessionId)) continue // chat session busy
+        try {
+          const inbox = await this.client.session.prompt({
+            sessionID: chatSessionId,
+            id: promptMessageId(task.task_id),
+            text: task.prompt_text ?? "",
+            delivery: "queue",
+            metadata: {
+              source: "dingtalk-ask",
+              taskID: task.task_id,
+              conversationID: task.conversation_id,
+            },
+          })
+          updateTask(this.db, task.task_id, {
+            status: "SUBMITTED",
+            session_id: chatSessionId,
+            inbox_id: inbox.id,
+            opencode_message_id: inbox.id,
+            submitted_at: Date.now(),
+          })
+          log.info("ask.submitted", { taskId: task.task_id, sessionId: chatSessionId })
+        } catch (error) {
+          updateTask(this.db, task.task_id, {
+            status: "FAILED",
+            error_code: "PROMPT_REJECTED",
+            error_message: (error as Error).message,
+            finished_at: Date.now(),
+          })
+          this.outbox.enqueue({
+            dedupeKey: `task:${task.task_id}:failed`,
+            taskId: task.task_id,
+            conversationId: task.conversation_id,
+            kind: "ERROR",
+            text: `❌ 问答提交失败（${task.task_id}）`,
+          })
+        }
+        continue
+      }
+
       let sessionId = conversation.active_session_id ?? undefined
       if (sessionId) {
         const active = sessionTask(this.db, sessionId)
@@ -1039,9 +1047,14 @@ export class Bridge {
         taskId: task.task_id,
         conversationId: task.conversation_id,
         kind: succeeded ? "RESULT" : "ERROR",
-        text: succeeded
-          ? `✅ 完成（${task.task_id}，用时 ${duration}s）${task.human_intervened ? " ⚠️ 本机有人工介入" : ""}\n${text || "<无输出>"}${truncated ? "\n（结果已截断，完整内容见本机 TUI）" : ""}`
-          : `❌ 失败（${task.task_id}，outcome=${outcome}）\n${text || "<无输出>"}`,
+        text:
+          task.kind === "ask"
+            ? succeeded
+              ? `${text || "<无输出>"}${truncated ? "\n（结果已截断，完整内容见本机 TUI）" : ""}`
+              : `❌ 问答失败（${task.task_id}，outcome=${outcome}）\n${text || "<无输出>"}`
+            : succeeded
+              ? `✅ 完成（${task.task_id}，用时 ${duration}s）${task.human_intervened ? " ⚠️ 本机有人工介入" : ""}\n${text || "<无输出>"}${truncated ? "\n（结果已截断，完整内容见本机 TUI）" : ""}`
+              : `❌ 失败（${task.task_id}，outcome=${outcome}）\n${text || "<无输出>"}`,
       })
       log.info("task.finished", {
         taskId: task.task_id,
@@ -1483,6 +1496,18 @@ export class Bridge {
 }
 
 export async function main(): Promise<void> {
+  // A background daemon must not die because one request failed. Log and
+  // keep serving (design §13.1): an unhandled rejection would otherwise take
+  // the whole bridge down and lose in-flight work.
+  process.on("unhandledRejection", (reason) => {
+    log.error("bridge.unhandled_rejection", {
+      error: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack?.slice(0, 400) : undefined,
+    })
+  })
+  process.on("uncaughtException", (error) => {
+    log.error("bridge.uncaught_exception", { error: error.message })
+  })
   const config = loadConfig()
   const secret = await readClientSecret()
   const db = openDatabase(config.bridge.dataDir)

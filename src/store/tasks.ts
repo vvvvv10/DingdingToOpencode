@@ -25,6 +25,8 @@ export type Task = {
   opencode_message_id: string | null
   approval_id: string | null
   prompt_text: string | null
+  /** "task" = executable task, "ask" = read-only question. */
+  kind: "task" | "ask"
   status: TaskStatus
   outcome: string | null
   error_code: string | null
@@ -89,12 +91,13 @@ export function createTask(
     senderStaffId: string
     projectAlias: string
     promptText: string
+    kind?: "task" | "ask"
   },
 ): Task {
   db.prepare(
     `INSERT INTO tasks (task_id, msg_id, conversation_id, sender_staff_id, project_alias,
-                        prompt_text, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)`,
+                        prompt_text, kind, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)`,
   ).run(
     input.taskId,
     input.msgId,
@@ -102,6 +105,7 @@ export function createTask(
     input.senderStaffId,
     input.projectAlias,
     input.promptText,
+    input.kind ?? "task",
     Date.now(),
   )
   return getTask(db, input.taskId)!

@@ -17,7 +17,8 @@
     "diag": "tsx scripts/diag-session.ts",
     "cli": "tsx scripts/bridge-cli.ts",
     "dev": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:ask": "tsx scripts/test-ask.ts"
   },
   "dependencies": {
     "@opencode/client": "2.0.32",

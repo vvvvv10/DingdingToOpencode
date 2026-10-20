@@ -472,13 +472,15 @@ DELETE /api/session/{id}/inbox/{inboxID}         → client.session.inbox.cancel
 
 | 输入 | 处理 |
 |---|---|
-| `/task <描述>` | 建任务，走完整执行链路 |
-| `/ask <问题>` | 只读 agent session（`dingtalk-chat`：read/glob/grep/web 允许，edit/shell/external_directory deny） |
+| `/task <描述>` | 建任务（kind=`task`），走完整执行链路 |
+| `/ask <问题>` | 建任务（kind=`ask`），走**同一套持久化链路**：只读 agent session（`dingtalk-chat`：read/glob/grep/web 允许，edit/shell/external_directory deny），不占项目锁，不加"摘要"后缀 |
 | 其他文本 | **不建任务**，回一条本地状态回复（当前任务 / 队列 / OpenCode 与钉钉连接状态 / 上次任务 / 用法提示）。**零模型调用、零副作用** |
 
 理由：群聊里一句"你在干啥"、"收到"、"谢谢"如果被当成任务，就等于**任何一句闲聊都可能触发本机远程执行**。`taskMode: "always"` 可恢复旧行为，但生产不建议。
 
 本地状态回复是"诚实的零成本答案"：它报告的是桥接自己的真实状态（任务队列、连接、版本），不是模型编的内容。
+
+**`/ask` 为什么也走任务管线**：问答同样要落库（task 行）、同样靠时间线判定结束、同样经 outbox 投递。这样即使 bridge 在回答途中重启，答案仍会在恢复后送达，而不是随进程一起消失。`kind` 字段区分两者（迁移 v3）。
 
 ### 6.8 Agent 的安装位置（易踩的坑）
 
@@ -1264,6 +1266,8 @@ permissions:
 | A-18 | Node 版本 | ⚠️ `@opencode/client` 的 SSE 读取依赖 `Promise.withResolvers`（Node 22+）；Node 20 需 polyfill（`src/polyfills.ts`） |
 | A-19 | 副作用观察 | ⚠️ 任务目标仓库是 bridge 自身时，`default` 预设下 agent **会直接改写 bridge 源码**（本次实测 agent 重构了 timeline.ts 并补齐了 limits/lock/heartbeat/retention 模块）→ **不要把 bridge 仓库设为默认项目** |
 | A-20 | 长时间任务 | ✅ 任务运行 14 分钟未结束时，bridge 保持 `RUNNING` 且不误判；心跳消息按 5 分钟间隔补充 |
+| A-21 | `/ask` 崩溃 | ❌→✅ 曾因 `chat_sessions` 表缺失（重构时 schema 改成版本化迁移，旧表没建）抛未捕获异常 → **进程直接崩溃** → launchd 重启 → in-flight 问答丢失。已修：① 迁移 v3 建表 ② 进程级 `unhandledRejection` / `uncaughtException` 兜底（**一个请求失败不能带走整个守护进程**）③ `/ask` 改走持久化任务管线，重启后仍能补发 |
+| A-22 | `/ask` 端到端 | ✅ 离线测试：只读 agent 16s 返回 `succeeded`，答案经 outbox 正确回传；`/ask 北京天气` 也能拿到实时数据 |
 
 **结论：架构从"durable log 为主"改为"消息时间线为主 + 全局事件流加速 + 轮询兜底"（§5.5）。**
 

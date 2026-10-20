@@ -145,9 +145,27 @@ const SCHEMA_V2 = `
 ALTER TABLE sessions ADD COLUMN last_poll_at INTEGER;
 `
 
+/**
+ * v3: task kinds + read-only chat sessions.
+ *
+ * `kind` separates executable tasks from read-only questions ("/ask"), so
+ * both can share the same durable pipeline (task row → timeline → outbox)
+ * and survive a bridge restart.
+ */
+const SCHEMA_V3 = `
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  conversation_id TEXT PRIMARY KEY,
+  session_id      TEXT NOT NULL,
+  created_at      INTEGER NOT NULL
+);
+ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
+CREATE INDEX IF NOT EXISTS idx_tasks_kind ON tasks(kind, status);
+`
+
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
   { version: 1, sql: SCHEMA_V1 },
   { version: 2, sql: SCHEMA_V2 },
+  { version: 3, sql: SCHEMA_V3 },
 ]
 
 export type Db = Database.Database
