@@ -72,6 +72,14 @@ export function recordInbound(
   return status
 }
 
+/** Mark an already recorded inbound message as rejected (keeps the dedupe row). */
+export function markInboundRejected(db: Db, msgId: string, reason: string): void {
+  db.prepare("UPDATE inbound_messages SET status = 'REJECTED', reason = ? WHERE msg_id = ?").run(
+    reason,
+    msgId,
+  )
+}
+
 export function createTask(
   db: Db,
   input: {

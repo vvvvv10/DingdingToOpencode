@@ -112,6 +112,12 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_received ON inbound_messages(received_at);
 
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  conversation_id TEXT PRIMARY KEY,
+  session_id      TEXT NOT NULL,
+  created_at      INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_locks (
   project_alias TEXT PRIMARY KEY,
   task_id       TEXT NOT NULL,

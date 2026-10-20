@@ -18,6 +18,7 @@ export type SessionRow = {
   project_alias: string
   title: string | null
   control_mode: string
+  last_seq: number
   last_poll_at: number | null
   created_at: number
   last_active_at: number | null
@@ -89,4 +90,9 @@ export function getSession(db: Db, sessionId: string): SessionRow | undefined {
 
 export function setSessionControlMode(db: Db, sessionId: string, mode: string): void {
   db.prepare("UPDATE sessions SET control_mode = ? WHERE session_id = ?").run(mode, sessionId)
+}
+
+/** Record the last timeline poll so the status command can show freshness. */
+export function touchSessionPoll(db: Db, sessionId: string, at = Date.now()): void {
+  db.prepare("UPDATE sessions SET last_poll_at = ? WHERE session_id = ?").run(at, sessionId)
 }

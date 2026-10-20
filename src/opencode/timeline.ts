@@ -28,6 +28,7 @@ export type TurnWindow = {
   found: boolean
   started: boolean
   text: string
+  parts: Array<{ messageId: string; text: string }>
   assistantMessageIds: string[]
   idleMessageId?: string
   outcome?: TurnOutcome
@@ -128,7 +129,7 @@ export async function fetchTurnWindow(
     cursor = previous
   }
 
-  return { found: false, started: false, text: "", assistantMessageIds: [] }
+  return { found: false, started: false, text: "", parts: [], assistantMessageIds: [] }
 }
 
 /** Collect everything known about the turn anchored at `userMessageId`. */
@@ -137,9 +138,9 @@ export function summarizeTurn(
   userMessageId: string,
 ): TurnWindow {
   const start = timeline.findIndex((message) => message.id === userMessageId)
-  if (start === -1) return { found: false, started: false, text: "", assistantMessageIds: [] }
+  if (start === -1) return { found: false, started: false, text: "", parts: [], assistantMessageIds: [] }
 
-  const parts: string[] = []
+  const parts: Array<{ messageId: string; text: string }> = []
   const assistantMessageIds: string[] = []
   let idleMessageId: string | undefined
   let outcome: TurnOutcome | undefined
@@ -152,16 +153,19 @@ export function summarizeTurn(
     }
     if (message.type === "assistant") {
       assistantMessageIds.push(message.id)
+      const chunks: string[] = []
       for (const part of message.content ?? []) {
-        if (part.type === "text" && part.text) parts.push(part.text)
+        if (part.type === "text" && part.text) chunks.push(part.text)
       }
+      if (chunks.length > 0) parts.push({ messageId: message.id, text: chunks.join("\n\n") })
     }
   }
 
   return {
     found: true,
     started: assistantMessageIds.length > 0,
-    text: parts.join("\n\n").trim(),
+    text: parts.map((part) => part.text).join("\n\n").trim(),
+    parts,
     assistantMessageIds,
     idleMessageId,
     outcome,

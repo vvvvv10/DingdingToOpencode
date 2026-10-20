@@ -69,6 +69,14 @@ const Config = z.object({
     maxTasksPerUserPerHour: z.number().int().positive().default(20),
     heartbeatMs: z.number().int().positive().default(300_000),
     approvalChannel: z.enum(["group", "dm"]).default("group"),
+    /**
+     * "prefix" (default): only `/task ...` starts a task; anything else is
+     *                  answered with the bridge's own status (no model call).
+     * "always": every non-command message is treated as a task (old behaviour).
+     */
+    taskMode: z.enum(["prefix", "always"]).default("prefix"),
+    /** Enable `/ask <question>` (read-only agent session). */
+    askEnabled: z.boolean().default(true),
     logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
   }),
   projects: z.array(Project).min(1),
