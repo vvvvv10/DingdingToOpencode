@@ -452,6 +452,8 @@ DELETE /api/session/{id}/inbox/{inboxID}         → client.session.inbox.cancel
 
 | 命令 | 行为 |
 |---|---|
+| `/task <描述>` | **执行一个任务**（唯一会真正动手的入口） |
+| `/ask <问题>` | 只读问答，走独立的只读 session（`dingtalk-chat` agent，不能改文件/跑命令） |
 | `/new` | 轮换 session（当前有活动任务时拒绝） |
 | `/status` | 返回项目、sessionID、当前任务、队列深度、待审批 ID、最近结果 |
 | `/cancel` | 取消当前任务 + 队列中全部待执行任务 |
@@ -459,9 +461,35 @@ DELETE /api/session/{id}/inbox/{inboxID}         → client.session.inbox.cancel
 | `/help` | 命令列表 |
 | `#approve <approvalID>` | 批准一次（仅 `once`） |
 | `#reject <approvalID> [原因]` | 拒绝 |
+| `允许` / `拒绝` | 快捷审批：仅当该会话**只有一个**待确认项时生效，多个会回列表要求指定编号 |
 | `#answer <formID> <值>` | v1.1 表单应答 |
 
 命令只允许白名单用户使用；`#approve` 只允许审批人使用（§8.2）。
+
+### 6.7 意图分流（关键安全边界）
+
+默认 `taskMode: "prefix"`：**只有显式指令才成为任务**。
+
+| 输入 | 处理 |
+|---|---|
+| `/task <描述>` | 建任务，走完整执行链路 |
+| `/ask <问题>` | 只读 agent session（`dingtalk-chat`：read/glob/grep/web 允许，edit/shell/external_directory deny） |
+| 其他文本 | **不建任务**，回一条本地状态回复（当前任务 / 队列 / OpenCode 与钉钉连接状态 / 上次任务 / 用法提示）。**零模型调用、零副作用** |
+
+理由：群聊里一句"你在干啥"、"收到"、"谢谢"如果被当成任务，就等于**任何一句闲聊都可能触发本机远程执行**。`taskMode: "always"` 可恢复旧行为，但生产不建议。
+
+本地状态回复是"诚实的零成本答案"：它报告的是桥接自己的真实状态（任务队列、连接、版本），不是模型编的内容。
+
+### 6.8 Agent 的安装位置（易踩的坑）
+
+OpenCode 只在**session 的 location 及其上级目录** + **全局 `~/.config/opencode/agents/`** 里发现 agent。桥接的 session 建在*项目*目录（例如 `~/tms/tms-web`），因此 `dingtalk` / `dingtalk-chat` 两个 agent 必须装在全局目录：
+
+```
+~/.config/opencode/agents/dingtalk.md
+~/.config/opencode/agents/dingtalk-chat.md
+```
+
+放在桥接自己的仓库里对项目 session **无效**，会导致 `session.create({agent:"dingtalk"})` 报 AgentNotFound。
 
 ---
 

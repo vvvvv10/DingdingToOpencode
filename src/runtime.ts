@@ -17,7 +17,8 @@ import { readClientSecret } from "./credentials.js"
 import { createLogger, type Logger } from "./logger.js"
 import { checkAdmission } from "./limits.js"
 import { connectOpenCode, OpenCodeUnavailableError } from "./opencode/client.js"
-import { fetchTurnWindow } from "./opencode/timeline.js"
+import { fetchTurnWindow, waitForTurn } from "./opencode/timeline.js"
+import { showApprovalDialog } from "./approvals/mac-dialog.js"
 import { DingTalkAdapter, type DingTalkInbound } from "./dingtalk/adapter.js"
 import { DingTalkSenderImpl, type SendTarget } from "./dingtalk/send.js"
 import { Outbox } from "./outbox.js"
@@ -81,6 +82,20 @@ export function promptMessageId(taskId: string): string {
   return `msg_bridge_${taskId}`
 }
 
+/** Read-only ruleset for `/ask` chat sessions. */
+const CHAT_PERMISSIONS = [
+  { action: "read", resource: "*", effect: "allow" as const },
+  { action: "glob", resource: "*", effect: "allow" as const },
+  { action: "grep", resource: "*", effect: "allow" as const },
+  { action: "webfetch", resource: "*", effect: "allow" as const },
+  { action: "websearch", resource: "*", effect: "allow" as const },
+  { action: "edit", resource: "*", effect: "deny" as const },
+  { action: "shell", resource: "*", effect: "deny" as const },
+  { action: "external_directory", resource: "*", effect: "deny" as const },
+  { action: "question", resource: "*", effect: "deny" as const },
+  { action: "subagent", resource: "*", effect: "deny" as const },
+]
+
 export class Bridge {
   private client: Client | undefined
   private openCodeVersion = "unknown"
@@ -89,6 +104,8 @@ export class Bridge {
   private adapter: DingTalkAdapter | undefined
   private replyFn: (message: DingTalkInbound, text: string) => Promise<void>
   private heartbeat: HeartbeatWriter | undefined
+  /** approvalId -> last time a macOS dialog was shown for it. */
+  private dialogShownAt = new Map<string, number>()
   private running = false
   private lastRetentionAt = 0
 
@@ -237,6 +254,35 @@ export class Bridge {
       return
     }
 
+    // ---- intent split -----------------------------------------------------
+    // A casual "你在干啥" must never become remote code execution on this
+    // machine. Only an explicit instruction becomes a task; anything else is
+    // answered with the bridge's own state (no model call, no side effects).
+    if (/^\/task(\s|$)/i.test(text)) {
+      const body = text.replace(/^\/task\s*/i, "").trim()
+      if (!body) {
+        await this.replyDirect(message, "用法：/task <要执行的任务>")
+        return
+      }
+      await this.startTask(message, project, body)
+      return
+    }
+
+    if (/^\/ask(\s|$)/i.test(text)) {
+      const body = text.replace(/^\/ask\s*/i, "").trim()
+      if (!body) {
+        await this.replyDirect(message, "用法：/ask <想问的问题>")
+        return
+      }
+      if (!this.opts.config.bridge.askEnabled) {
+        await this.replyDirect(message, "只读问答已关闭。")
+        return
+      }
+      await this.replyDirect(message, "🤔 思考中…")
+      void this.runAsk(message, project, body)
+      return
+    }
+
     if (text.startsWith("/")) {
       await this.handleCommand(message, project, text)
       return
@@ -245,7 +291,30 @@ export class Bridge {
       await this.handleApprovalCommand(message, project, text)
       return
     }
+    if (/^(允许|批准|同意|approve|allow)$/i.test(text.trim())) {
+      await this.handleQuickApproval(message, project, "approve")
+      return
+    }
+    if (/^(拒绝|驳回|reject|deny)$/i.test(text.trim())) {
+      await this.handleQuickApproval(message, project, "reject")
+      return
+    }
 
+    if (this.opts.config.bridge.taskMode === "always") {
+      await this.startTask(message, project, text)
+      return
+    }
+
+    // Not an instruction: answer with local state, no model call.
+    await this.replyDirect(message, this.buildStatusReply(project))
+  }
+
+  /** Admit a task: validate, persist, schedule. */
+  private async startTask(
+    message: DingTalkInbound,
+    project: ProjectConfig,
+    text: string,
+  ): Promise<void> {
     if (text.length > this.opts.config.bridge.maxPromptChars) {
       markInboundRejected(this.db, message.msgId, "prompt_too_long")
       await this.replyDirect(message, `任务过长（上限 ${this.opts.config.bridge.maxPromptChars} 字符）。`)
@@ -317,6 +386,254 @@ export class Bridge {
     await this.schedule()
   }
 
+  /**
+   * Local, zero-cost answer for non-instructional messages.
+   *
+   * "你在干啥" must never become a task; answering with the bridge's own
+   * state is both truthful and instant.
+   */
+  private buildStatusReply(project: ProjectConfig): string {
+    const active = activeTasks(this.db)
+    const queued = active.filter((task) => task.status === "PENDING").length
+    const running = active.filter((task) => task.status !== "PENDING")
+    const last = this.db
+      .prepare(
+        "SELECT task_id, status, outcome, finished_at FROM tasks ORDER BY created_at DESC LIMIT 1",
+      )
+      .get() as
+      | { task_id: string; status: string; outcome: string | null; finished_at: number | null }
+      | undefined
+
+    const lines = [
+      "🤖 桥接待命中（我没把这句当任务执行）",
+      `· 项目：${project.alias} → ${project.directory}`,
+      `· 当前任务：${running.length > 0 ? running.map((task) => `${task.task_id}(${task.status})`).join(", ") : "无"}`,
+      `· 队列：${queued}`,
+      `· OpenCode：${this.client ? `${this.openCodeVersion} ✓` : "未运行 ✗"}`,
+      `· 钉钉：${this.adapter?.isConnected ? "已连接 ✓" : "未连接 ✗"}`,
+    ]
+    if (last) {
+      const when = last.finished_at
+        ? new Date(last.finished_at).toLocaleString("zh-CN", { hour12: false })
+        : "进行中"
+      lines.push(`· 上次任务：${last.task_id} (${last.outcome ?? last.status}) ${when}`)
+    }
+    lines.push("", "要干活发：/task <描述>", "要问问题发：/ask <问题>", "命令列表：/help")
+    return lines.join("\n")
+  }
+
+  /**
+   * Mobile-friendly approval: reply "允许" / "拒绝" without typing a code.
+   * Only applies when the conversation has exactly one pending approval.
+   */
+  private async handleQuickApproval(
+    message: DingTalkInbound,
+    project: ProjectConfig,
+    decision: "approve" | "reject",
+  ): Promise<void> {
+    const pending = this.db
+      .prepare(
+        `SELECT a.* FROM approvals a
+         JOIN tasks t ON t.task_id = a.task_id
+         WHERE t.conversation_id = ? AND a.status = 'PENDING'
+         ORDER BY a.requested_at ASC`,
+      )
+      .all(message.conversationId) as Array<{
+      approval_id: string
+      task_id: string
+      session_id: string
+      request_id: string
+    }>
+
+    if (pending.length === 0) {
+      await this.replyDirect(message, "当前没有待确认项。")
+      return
+    }
+    if (pending.length > 1) {
+      const ids = pending.map((item) => item.approval_id).join("、")
+      await this.replyDirect(message, `有 ${pending.length} 个待确认项，请指定编号：${ids}`)
+      return
+    }
+
+    const approval = pending[0]!
+    const approvers = project.approvers.length > 0 ? project.approvers : project.allowedUsers
+    if (approvers.length > 0 && !approvers.includes(message.senderStaffId)) {
+      await this.replyDirect(message, "⛔ 你没有审批权限。")
+      return
+    }
+
+    const applied = await this.applyApproval(approval, decision, message.senderStaffId)
+    if (!applied.ok) {
+      await this.replyDirect(message, applied.message)
+      return
+    }
+    await this.replyDirect(
+      message,
+      decision === "approve"
+        ? `✅ 已批准 ${approval.approval_id}，继续执行。`
+        : `🚫 已拒绝 ${approval.approval_id}。`,
+    )
+  }
+
+  /**
+   * Apply a decision to a pending approval and forward it to OpenCode.
+   *
+   * Shared by the DingTalk command, the one-key reply, the macOS dialog and
+   * the local CLI. The database claim guarantees a single winner.
+   */
+  private async applyApproval(
+    approval: {
+      approval_id: string
+      task_id: string
+      session_id: string
+      request_id: string
+    },
+    decision: "approve" | "reject",
+    decidedBy: string,
+    note?: string,
+  ): Promise<{ ok: boolean; message: string }> {
+    const claimed = this.db
+      .prepare(
+        "UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, decision_note = ? WHERE approval_id = ? AND status = 'PENDING'",
+      )
+      .run(
+        decision === "approve" ? "APPROVED" : "REJECTED",
+        Date.now(),
+        decidedBy,
+        note ?? null,
+        approval.approval_id,
+      )
+    if (claimed.changes === 0) {
+      return { ok: false, message: "该确认项已被处理。" }
+    }
+
+    if (!this.client) {
+      return { ok: false, message: "⚠️ 本机 OpenCode 未运行，无法继续。" }
+    }
+
+    try {
+      await this.client.permission.reply({
+        sessionID: approval.session_id,
+        requestID: approval.request_id,
+        decision: decision === "approve" ? "once" : "reject",
+        message: note ?? undefined,
+      })
+    } catch (error) {
+      log.warn("approval.reply.failed", {
+        approvalId: approval.approval_id,
+        error: (error as Error).message,
+      })
+      return { ok: false, message: "提交确认失败，请重试或联系管理员。" }
+    }
+
+    const task = getTask(this.db, approval.task_id)
+    if (task) {
+      updateTask(this.db, task.task_id, { status: "RUNNING", approval_id: null })
+      this.outbox.enqueue({
+        dedupeKey: `task:${task.task_id}:approval_decided:${approval.approval_id}`,
+        taskId: task.task_id,
+        conversationId: task.conversation_id,
+        kind: "STATUS",
+        text:
+          decision === "approve"
+            ? `✅ 确认项 ${approval.approval_id} 已批准，继续执行。`
+            : `🚫 确认项 ${approval.approval_id} 已拒绝。`,
+      })
+    }
+
+    audit(this.db, {
+      actorType: decidedBy === "mac" ? "SYSTEM" : "USER",
+      actorId: decidedBy,
+      action: decision === "approve" ? "approval.approved" : "approval.rejected",
+      taskId: approval.task_id,
+      sessionId: approval.session_id,
+      conversationId: task?.conversation_id,
+      detail: { approvalId: approval.approval_id, note: note ?? null, via: decidedBy },
+      result: "OK",
+    })
+    return { ok: true, message: "ok" }
+  }
+
+  /**
+   * Read-only question answering on a dedicated session.
+   *
+   * The chat session uses a read-only agent and never touches the task
+   * session's context.
+   */
+  private async runAsk(
+    message: DingTalkInbound,
+    project: ProjectConfig,
+    question: string,
+  ): Promise<void> {
+    if (!this.client) {
+      await this.replyDirect(message, "⚠️ 本机 OpenCode 未运行。")
+      return
+    }
+    const sessionId = await this.ensureChatSession(message.conversationId, project)
+    if (!sessionId) {
+      await this.replyDirect(message, "⚠️ 无法创建只读会话。")
+      return
+    }
+    try {
+      const inbox = await this.client.session.prompt({
+        sessionID: sessionId,
+        text: question,
+        delivery: "queue",
+        metadata: { source: "dingtalk-ask", conversationID: message.conversationId },
+      })
+      const turn = await waitForTurn(this.client, sessionId, inbox.id, { timeoutMs: 180_000 })
+      if (!turn) {
+        await this.replyDirect(message, "⌛ 回答超时，请重试。")
+        return
+      }
+      const text = (turn.text || "<无输出>").slice(0, this.opts.config.bridge.maxResultChars)
+      await this.replyDirect(
+        message,
+        turn.outcome === "succeeded" ? text : `❌ 问答失败（${turn.outcome}）\n${text}`,
+      )
+    } catch (error) {
+      log.error("ask.failed", { error: (error as Error).message })
+      await this.replyDirect(message, "❌ 问答失败。")
+    }
+  }
+
+  private async ensureChatSession(
+    conversationId: string,
+    project: ProjectConfig,
+  ): Promise<string | undefined> {
+    if (!this.client) return undefined
+    const existing = this.db
+      .prepare("SELECT session_id FROM chat_sessions WHERE conversation_id = ?")
+      .get(conversationId) as { session_id: string } | undefined
+    if (existing) {
+      try {
+        await this.client.session.get({ sessionID: existing.session_id })
+        return existing.session_id
+      } catch {
+        // session gone: fall through and create a new one
+      }
+    }
+    try {
+      const session = await this.client.session.create({
+        location: { directory: project.directory },
+        title: `DingTalk chat / ${project.alias}`,
+        agent: "dingtalk-chat",
+        metadata: { source: "dingtalk-bridge", kind: "chat" },
+        permissions: CHAT_PERMISSIONS,
+      })
+      this.db
+        .prepare(
+          "INSERT INTO chat_sessions (conversation_id, session_id, created_at) VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET session_id = excluded.session_id",
+        )
+        .run(conversationId, session.id, Date.now())
+      log.info("chat.session.created", { sessionId: session.id })
+      return session.id
+    } catch (error) {
+      log.error("chat.session.failed", { error: (error as Error).message })
+      return undefined
+    }
+  }
+
   private resolveRoute(
     message: DingTalkInbound,
   ): { ok: true; project: ProjectConfig } | { ok: false; code: string; message: string } {
@@ -352,6 +669,8 @@ export class Bridge {
         message,
         [
           "可用命令：",
+          "/task <描述> 执行一个任务（只有这个会真的动手）",
+          "/ask <问题> 只读问答（不会改任何文件）",
           "/status 查看当前任务与会话",
           "/cancel 取消当前任务与排队任务",
           "/resume 恢复被本机输入暂停的会话",
@@ -478,54 +797,16 @@ export class Bridge {
       return
     }
 
-    const claimed = this.db
-      .prepare(
-        "UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, decision_note = ? WHERE approval_id = ? AND status = 'PENDING'",
-      )
-      .run(
-        action === "approve" ? "APPROVED" : "REJECTED",
-        Date.now(),
-        message.senderStaffId,
-        note ?? null,
-        approval.approval_id,
-      )
-    if (claimed.changes === 0) {
-      await this.replyDirect(message, "该确认项已被处理。")
+    const applied = await this.applyApproval(
+      approval,
+      action === "approve" ? "approve" : "reject",
+      message.senderStaffId,
+      note,
+    )
+    if (!applied.ok) {
+      await this.replyDirect(message, applied.message)
       return
     }
-
-    if (!this.client) {
-      await this.replyDirect(message, "⚠️ 本机 OpenCode 未运行，无法继续。")
-      return
-    }
-
-    try {
-      await this.client.permission.reply({
-        sessionID: approval.session_id,
-        requestID: approval.request_id,
-        decision: action === "approve" ? "once" : "reject",
-        message: note ?? undefined,
-      })
-    } catch (error) {
-      log.warn("approval.reply.failed", {
-        approvalId: approval.approval_id,
-        error: (error as Error).message,
-      })
-      await this.replyDirect(message, "提交确认失败，请重试或联系管理员。")
-      return
-    }
-
-    updateTask(this.db, task.task_id, { status: "RUNNING", approval_id: null })
-    audit(this.db, {
-      actorType: "USER",
-      actorId: message.senderStaffId,
-      action: action === "approve" ? "approval.approved" : "approval.rejected",
-      taskId: task.task_id,
-      sessionId: approval.session_id,
-      conversationId: message.conversationId,
-      detail: { approvalId: approval.approval_id, note: note ?? null },
-      result: "OK",
-    })
     await this.replyDirect(
       message,
       action === "approve" ? "✅ 已批准，继续执行。" : "🚫 已拒绝该操作。",
@@ -854,6 +1135,15 @@ export class Bridge {
         detail: { approvalId, action: request.action },
         result: "PENDING",
       })
+
+      // Native macOS dialog: approve without touching the phone. Shown at most
+      // once per 3 minutes per approval so a dismissed dialog does not spam.
+      this.offerMacDialog(task, {
+        approval_id: approvalId,
+        task_id: task.task_id,
+        session_id: task.session_id!,
+        request_id: request.id,
+      }, request)
     }
 
     // Approvals that disappeared were answered elsewhere (e.g. in the TUI).
@@ -906,6 +1196,40 @@ export class Bridge {
         log.warn("form.cancel.failed", { formId: form.id, error: (error as Error).message })
       }
     }
+  }
+
+  /** Show the native macOS approval dialog (at most once per 3 minutes). */
+  private offerMacDialog(
+    task: Task,
+    approval: {
+      approval_id: string
+      task_id: string
+      session_id: string
+      request_id: string
+    },
+    request: { action: string; resources?: string[]; message?: string },
+  ): void {
+    const last = this.dialogShownAt.get(approval.approval_id)
+    if (last && Date.now() - last < 180_000) return
+    this.dialogShownAt.set(approval.approval_id, Date.now())
+
+    const resources = (request.resources ?? []).join(", ").slice(0, 300)
+    showApprovalDialog({
+      title: `任务 ${task.task_id} 需要确认 [${approval.approval_id}]`,
+      detail: `动作：${request.action}\n资源：${resources}\n${request.message ?? ""}`,
+      timeoutSeconds: Math.floor(this.opts.config.bridge.approvalTimeoutMs / 1000),
+      log,
+      onDecision: (choice) => {
+        if (choice === "ignored") return
+        void this.applyApproval(approval, choice, "mac").then((result) => {
+          log.info("approval.macdialog", {
+            approvalId: approval.approval_id,
+            choice,
+            ok: result.ok,
+          })
+        })
+      },
+    })
   }
 
   private async expireApprovals(): Promise<void> {
