@@ -1,0 +1,54 @@
+{
+  "dingtalk": {
+    "clientId": "dingxxxxxxxxxxxxxxxx",
+    "robotCode": "dingxxxxxxxxxxxxxxxx"
+  },
+  "opencode": {
+    "versionRange": ">=2.0.18 <2.1.0",
+    "requiredRoutes": [
+      "POST /api/session",
+      "GET /api/session/{sessionID}",
+      "GET /api/session/active",
+      "POST /api/session/{sessionID}/prompt",
+      "GET /api/session/{sessionID}/inbox",
+      "DELETE /api/session/{sessionID}/inbox/{inboxID}",
+      "GET /api/experimental/session/{sessionID}/log",
+      "POST /api/session/{sessionID}/interrupt",
+      "GET /api/session/{sessionID}/permission",
+      "POST /api/session/{sessionID}/permission/{requestID}/reply",
+      "GET /api/session/{sessionID}/form",
+      "POST /api/session/{sessionID}/form/{formID}/reply",
+      "DELETE /api/session/{sessionID}/form/{formID}"
+    ]
+  },
+  "bridge": {
+    "dataDir": "~/Library/Application Support/opencode-dingtalk-bridge",
+    "approvalTimeoutMs": 600000,
+    "maxTaskDurationMs": 7200000,
+    "maxPromptChars": 8000,
+    "maxResultChars": 3500,
+    "maxQueuePerSession": 10,
+    "maxTasksPerUserPerHour": 20,
+    "approvalChannel": "group",
+    "logLevel": "info"
+  },
+  "projects": [
+    {
+      "alias": "my-app",
+      "directory": "~/code/my-app",
+      "agent": "dingtalk",
+      "allowedConversations": ["cidxxxxxxxxxxxxxx=="],
+      "allowedUsers": ["012345678901234567"],
+      "approvers": ["012345678901234567"],
+      "permissions": [
+        { "action": "external_directory", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "ask" },
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "ask" },
+        { "action": "websearch", "resource": "*", "effect": "ask" },
+        { "action": "question", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" }
+      ]
+    }
+  ]
+}

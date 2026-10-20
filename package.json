@@ -1,0 +1,30 @@
+{
+  "name": "opencode-dingtalk-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DingTalk bridge for a local OpenCode V2 service (design: docs/design.md)",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "probe": "tsx scripts/p0-probe.ts",
+    "probe:dingtalk": "tsx scripts/p0-dingtalk.ts",
+    "diag": "tsx scripts/diag-session.ts",
+    "cli": "tsx scripts/bridge-cli.ts",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/client": "2.0.32",
+    "better-sqlite3": "^11.10.0",
+    "dingtalk-stream": "2.1.6-beta.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.19.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
