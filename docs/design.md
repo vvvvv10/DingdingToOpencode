@@ -456,6 +456,7 @@ DELETE /api/session/{id}/inbox/{inboxID}         → client.session.inbox.cancel
 | `/ask <问题>` | 只读问答，走独立的只读 session（`dingtalk-chat` agent，不能改文件/跑命令） |
 | `/new` | 轮换 session（当前有活动任务时拒绝） |
 | `/status` | 返回项目、sessionID、当前任务、队列深度、待审批 ID、最近结果 |
+| `/sessions` | **本机所有 OpenCode session 概览**：运行中/空闲、agent、项目目录、最后更新时间、"正在跑什么"（最后一个工具调用或叙述）；桥接自己的 session 标注 `〔本桥接〕` |
 | `/cancel` | 取消当前任务 + 队列中全部待执行任务 |
 | `/resume` | 解除"人工接管暂停"，恢复自动派发 |
 | `/help` | 命令列表 |
@@ -481,6 +482,16 @@ DELETE /api/session/{id}/inbox/{inboxID}         → client.session.inbox.cancel
 本地状态回复是"诚实的零成本答案"：它报告的是桥接自己的真实状态（任务队列、连接、版本），不是模型编的内容。
 
 **`/ask` 为什么也走任务管线**：问答同样要落库（task 行）、同样靠时间线判定结束、同样经 outbox 投递。这样即使 bridge 在回答途中重启，答案仍会在恢复后送达，而不是随进程一起消失。`kind` 字段区分两者（迁移 v3）。
+
+### 6.8 观察本机其它 session
+
+TUI 一次只能看一个 session，"其它 session 在干什么"没有内置入口。桥接补上这个视角：
+
+- `/sessions` → 列出本机最近的 OpenCode session：运行中（`▶️`）/空闲（`○`）、标题、agent、项目目录、最后更新时间，以及**正在做什么**（最后一个工具调用如"正在跑 shell"，或最后一段叙述 / 推理）。
+- 闲聊分支的状态回复里也带一行"其它运行中的 session"。
+- 桥接自己创建的 session 标注 `〔本桥接〕`。
+
+数据来源：`GET /api/session?limit=N`（列表）+ `GET /api/session/active`（运行中集合）+ 每个 session 的 `GET /api/session/{id}/message?order=desc&limit=1`（最后一条消息）。
 
 ### 6.8 Agent 的安装位置（易踩的坑）
 

@@ -18,7 +18,8 @@
     "cli": "tsx scripts/bridge-cli.ts",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test:ask": "tsx scripts/test-ask.ts"
+    "test:ask": "tsx scripts/test-ask.ts",
+    "sessions": "tsx scripts/show-sessions.ts"
   },
   "dependencies": {
     "@opencode/client": "2.0.32",

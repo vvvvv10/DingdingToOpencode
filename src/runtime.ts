@@ -308,7 +308,8 @@ export class Bridge {
     }
 
     // Not an instruction: answer with local state, no model call.
-    await this.replyDirect(message, this.buildStatusReply(project))
+    const others = await this.buildOtherSessionsSummary()
+    await this.replyDirect(message, this.buildStatusReply(project) + (others ? `\n${others}` : ""))
   }
 
   /** Admit a task: validate, persist, schedule. */
@@ -394,6 +395,82 @@ export class Bridge {
   }
 
   /**
+   * Machine-wide session overview.
+   *
+   * The TUI shows one session at a time, so there is no built-in way to see
+   * what the *other* sessions are doing. This lists every recent session with
+   * its state (running / idle), project, agent and what it is doing right now
+   * (its last tool call, or its last narration).
+   */
+  private async buildSessionOverview(limit = 8): Promise<string> {
+    if (!this.client) return "⚠️ 本机 OpenCode 未运行，看不到 session。"
+
+    let sessions: Array<Record<string, any>>
+    let activeIds: Set<string>
+    try {
+      const [list, active] = await Promise.all([
+        this.client.session.list({ limit, order: "desc" }),
+        this.client.session.active(),
+      ])
+      sessions = (list.data ?? []) as Array<Record<string, any>>
+      activeIds = new Set(Object.keys(active ?? {}))
+    } catch (error) {
+      log.warn("sessions.overview.failed", { error: (error as Error).message })
+      return "⚠️ 读取 session 列表失败。"
+    }
+
+    if (sessions.length === 0) return "本机没有 session。"
+
+    const lines = ["🗂 本机 OpenCode session："]
+    for (const session of sessions) {
+      const id = String(session.id ?? "")
+      const running = activeIds.has(id)
+      const directory = String(session.location?.directory ?? "?")
+      const title = String(session.title ?? "(无标题)")
+      const agent = String(session.agent ?? "?")
+      const mine = session.metadata?.source === "dingtalk-bridge"
+
+      let doing = ""
+      try {
+        const messages = await this.client.message.list({
+          sessionID: id,
+          order: "desc",
+          limit: 1,
+        })
+        doing = describeLastActivity(messages.data?.[0] as Record<string, any> | undefined)
+      } catch {
+        doing = ""
+      }
+
+      const updated = session.time?.updated
+        ? new Date(Number(session.time.updated)).toLocaleString("zh-CN", {
+            hour12: false,
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "?"
+
+      lines.push(
+        [
+          running ? "▶️" : "○",
+          `${title}`.slice(0, 40),
+          `〔${agent}〕`,
+          `〔${basename(directory)}〕`,
+          mine ? "〔本桥接〕" : "",
+          updated,
+          doing ? `· ${doing}` : "",
+        ]
+          .filter(Boolean)
+          .join(" "),
+      )
+    }
+    lines.push("", "▶️ = 正在运行，○ = 空闲。id 可用于 TUI /sessions 打开。")
+    return lines.join("\n")
+  }
+
+  /**
    * Local, zero-cost answer for non-instructional messages.
    *
    * "你在干啥" must never become a task; answering with the bridge's own
@@ -427,6 +504,26 @@ export class Bridge {
     }
     lines.push("", "要干活发：/task <描述>", "要问问题发：/ask <问题>", "命令列表：/help")
     return lines.join("\n")
+  }
+
+  /** One-line summary of the other running sessions on this machine. */
+  private async buildOtherSessionsSummary(): Promise<string> {
+    if (!this.client) return ""
+    try {
+      const active = await this.client.session.active()
+      const ids = Object.keys(active ?? {})
+      if (ids.length === 0) return ""
+      const parts: string[] = []
+      for (const id of ids.slice(0, 3)) {
+        const session = await this.client.session.get({ sessionID: id })
+        parts.push(
+          `${String(session.title ?? "(无标题)").slice(0, 24)}〔${String(session.agent ?? "?")}〕`,
+        )
+      }
+      return `· 其它运行中的 session：${parts.join("、")}`
+    } catch {
+      return ""
+    }
   }
 
   /**
@@ -636,12 +733,18 @@ export class Bridge {
           "/task <描述> 执行一个任务（只有这个会真的动手）",
           "/ask <问题> 只读问答（不会改任何文件）",
           "/status 查看当前任务与会话",
+          "/sessions 查看本机所有 OpenCode session 在干什么",
           "/cancel 取消当前任务与排队任务",
           "/resume 恢复被本机输入暂停的会话",
           "/new 开启新会话",
           "/help 本帮助",
         ].join("\n"),
       )
+      return
+    }
+
+    if (command === "/sessions") {
+      await this.replyDirect(message, await this.buildSessionOverview())
       return
     }
 
@@ -1528,4 +1631,38 @@ export async function main(): Promise<void> {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, shutdown)
   }
+}
+
+
+function basename(path: string): string {
+  const parts = path.split("/").filter(Boolean)
+  return parts[parts.length - 1] ?? path
+}
+
+/**
+ * Describe what a session is doing right now from its last message:
+ * a running/completed tool call, or the last narration.
+ */
+function describeLastActivity(message: Record<string, any> | undefined): string {
+  if (!message) return ""
+  if (message.type === "idle") return ""
+  const content = (message.content ?? []) as Array<Record<string, any>>
+  for (const part of content) {
+    if (part.type === "tool") {
+      const status = String(part.state?.status ?? "")
+      const name = String(part.name ?? part.tool ?? "tool")
+      if (status === "running" || status === "pending") return `正在跑 ${name}`
+    }
+  }
+  for (const part of content) {
+    if (part.type === "text" && part.text) {
+      return String(part.text).replace(/\s+/g, " ").slice(0, 60)
+    }
+  }
+  for (const part of content) {
+    if (part.type === "reasoning" && part.text) {
+      return `思考中：${String(part.text).replace(/\s+/g, " ").slice(0, 50)}`
+    }
+  }
+  return ""
 }
