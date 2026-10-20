@@ -45,7 +45,8 @@
 | D1 | TUI 在 MVP 的角色 | **只读**；检测到非桥接输入的任务标记 `HUMAN_INTERVENED` | TUI 中 Enter 是 steer 而非排队，会破坏任务边界与审批归属 |
 | D2 | 关闭桥接时在途任务 | **继续执行**；桥接重启后补发结果 | 桥接不是执行者，OpenCode 拥有执行生命周期 |
 | D3 | Forms / question | MVP **deny `question` 权限**；v1.1 支持文本应答 | 不处理会让任务永久挂起 |
-| D4 | 审批策略 | `shell` = ask；`external_directory` = deny；`edit` 项目内 allow；`webfetch/websearch` = ask；审批人 = 任务发起人（可配管理员）；超时 **10 分钟**自动 reject | 删除/外传类操作必须人工确认，且不允许永久放行 |
+| D4 | 审批策略 | **可切换预设**，默认 `default` = OpenCode 原生放行；`strict` = shell/web ask、跨目录 deny。`question` / `subagent` 两种预设下都 deny（功能性限制，非策略） | 逐条审批在手机上不可用；用户明确要求"OpenCode 默认允许" |
+| D5 | 审批渠道 | **4 条并存**：① TUI 原生弹窗 ② Mac 原生对话框 ③ 钉钉回「允许/拒绝」④ 本机 CLI | 审批应该发生在电脑上，而不是手机上 |
 
 补充决策：
 
@@ -53,6 +54,9 @@
 - D6：事件**双通道**——per-session durable log 负责任务生命周期与最终文本，全局 `/api/event` 负责 permission / form / idle，并配合轮询对账。
 - D7：完成判定依据是 `session.execution.succeeded|failed|interrupted` + `session.text.ended`，**不是** `session.idle`。
 - D8：项目目录只能来自配置白名单，**不允许**由消息内容决定。
+- D9：权限策略可在**运行中**通过 `PATCH /api/session/{id}` 就地改写，换预设不需要 `/new`。
+- D10：长任务每 5 分钟发一次心跳（`⏳ 仍在执行`），避免"卡住了还是没开始"的焦虑。
+- D11：时间线定位锚点改用**游标**：`GET /api/session/{id}/message` 的 `cursor` **不能与 `order` 同时使用**（服务端报 "Cursor cannot be combined with order"），因此翻页时只能带 `cursor`，方向由游标自带。
 
 ---
 
@@ -262,10 +266,11 @@ msg_yyy  assistant 2026-10-20T05:42:53.051Z  :: PONG
 msg_zzz  idle      2026-10-20T05:42:54.541Z  outcome=succeeded
 ```
 
-- **`type:"idle"` 且带 `outcome` 的消息 = 回合结束标记**，是任务完成/失败/中断的**权威判据**。
+- **`type:"idle"` 且带 `outcome` 的消息 = 回合结束标记**，是任务完成/失败/中断的**权威判据**（不带 outcome 的 stray idle 必须忽略，否则会提前结束任务）。
 - 任务结果 = 该任务的 user 消息与 idle 标记之间的 assistant 文本片段。
 - 该端点**持久且可分页**（`cursor.previous` / `cursor.next`），因此它是桥接程序重启后重建状态的唯一可靠依据。
 - 锚点：`prompt` 响应返回的 `id` **就是**该任务 user 消息的 id，可直接用于"只取我这条任务之后的消息"。
+- **分页陷阱**：`order=asc&limit=N` 返回的是**最早**的 N 条，长会话会把锚点挤出窗口 → 任务永远判不出结果。正确做法是**先取最新一页（`order=desc`）**，再用 `cursor.previous` 往回翻；且 **`cursor` 不能与 `order` 同时传**（服务端拒绝），翻页请求只能带 `cursor`。
 
 **L3 · 空闲长轮询（降低轮询频率）**
 
@@ -538,46 +543,63 @@ conversationId ──▶ projectAlias ──▶ directory（绝对路径，白�
 
 ## 8. 审批与人机交互
 
-### 8.1 权限策略
+### 8.1 权限策略（预设可切换）
 
-MVP 基准策略（写在专用 agent `dingtalk` 的 permissions 中，agent 规则晚于全局规则生效）：
+策略以**预设**形式配置：`projects[].permissionPreset` = `default` | `strict`；也可直接给 `projects[].permissions` 显式规则覆盖预设。
+
+**`default`（当前启用）——对齐 OpenCode 原生放行**
 
 | action | effect | 说明 |
 |---|---|---|
-| `read` / `glob` / `grep` | allow | 项目内检索 |
-| `edit` | allow | 项目内修改（含 write/patch） |
-| `shell` | **ask** | 任意命令需人工确认（删除文件走 shell，因此已被覆盖） |
-| `external_directory` | **deny** | V2 默认允许，必须显式 deny |
-| `webfetch` / `websearch` | ask | 防外传（防 prompt injection 外泄代码/密钥） |
-| `question` | **deny** | MVP 不支持交互式提问（D3） |
-| `subagent` | deny | 避免子 session 带来的审批归属与费用复杂度 |
-| `read *.env*` | ask | V2 默认行为，保留 |
+| `read` / `glob` / `grep` / `edit` / `shell` / `webfetch` / `websearch` / `external_directory` | allow（OpenCode 默认） | 与本机 TUI 的默认体验一致 |
+| `question` | **deny** | 功能性限制：MVP 没有应答通道，否则任务会永久挂起 |
+| `subagent` | **deny** | 功能性限制：子 session 的审批请求桥接看不到 |
+
+两条 deny 都是**硬拒绝**，不会弹审批框，因此不影响"不被打断"的体验。
+
+**`strict`——原硬化档**
+
+| action | effect |
+|---|---|
+| `read` / `glob` / `grep` | allow（项目内） |
+| `edit` | allow（项目内） |
+| `shell` | **ask** |
+| `external_directory` | **deny** |
+| `webfetch` / `websearch` | ask |
+| `question` / `subagent` | deny |
 
 补充：
 
-- `external_directory` 规则对 `read`/`edit`/`write`/`patch` 以及 shell 的工作目录推断生效，是防止"跑到项目外"的主闸门。
-- 若需放开 `subagent`（v1.1），必须同时跟踪 `parentID` 子 session 的权限请求。
-- 另可在 OpenCode 侧配置 `policies` 做组织级硬拒绝（`tool.use` 规则），优先级高于项目配置。
+- 预设切换**不需要新建 session**：桥接在 reconcile 时用 `PATCH /api/session/{id}` 把当前 session 的 ruleset 改写为生效预设（D9）。
+- 放开 `subagent`（v1.1）必须同时跟踪 `parentID` 子 session 的审批请求，否则子 session 的 `ask` 无人应答。
+- 组织级硬拒绝仍可用 OpenCode 的 `policies`（`tool.use` 规则），优先级高于项目配置。
+- **`default` 预设下的安全边界只剩三处**：钉钉用户/会话白名单、项目目录白名单、审计日志。远程输入因此等同于本机输入，务必保证机器人账号与可见范围安全。
 
-### 8.2 审批流
+### 8.2 审批流（4 条渠道）
 
 ```
 permission.asked
   → 建审批单（approvalID 短码，expires_at = now + 10min）
-  → 钉钉消息：⚠️ 需要确认 [A-7F3K] action=shell
-              resources: rm -rf build/ && ...
-              回复：#approve A-7F3K   或   #reject A-7F3K
-  → 收到 #approve → client.permission.reply({ decision: "once" })
-  → 收到 #reject  → client.permission.reply({ decision: "reject", message })
-  → 超时 10min    → 自动 reject + 通知
+  → 同时推送到 4 个渠道（任一先响应者生效，其余自动失效）
 ```
+
+| # | 渠道 | 交互 | 实现 |
+|---|---|---|---|
+| ① | **TUI 原生弹窗** | 终端里点允许/拒绝 | OpenCode 自身渲染；桥接从 `permission.replied` 识别为 `REMOTE_HANDLED` 并回钉钉告知 |
+| ② | **Mac 原生对话框** | 桌面弹窗，点「允许一次 / 拒绝」，10 分钟自动关闭 | `osascript display dialog ... giving up after 600`（`src/approvals/mac-dialog.ts`） |
+| ③ | **钉钉回「允许 / 拒绝」** | 手机上直接发两个字 | 该会话**只有一个**待确认项时生效；多个则回列表要求指定编号 |
+| ④ | **本机 CLI** | 终端 `npm run cli -- approve A-7F3K` | `scripts/bridge-cli.ts`（`status` / `approvals` / `approve` / `reject`） |
+
+钉钉消息仍然照发（`#approve A-7F3K` / `#reject A-7F3K`），作为**跨设备兜底**与留痕。
 
 规则：
 
-- 只有**任务发起人**（或配置的 `approvers`）可以批准/拒绝；其他人的 `#approve` 被拒绝并记录审计。
+- 钉钉渠道与 CLI 渠道：只有**任务发起人**（或配置的 `approvers`）可以批准/拒绝，其他人的请求被拒绝并记录审计。
+- Mac 对话框属于本机操作，等价于本机用户在场，默认放行给发起人上下文。
 - 审批短码与 conversation + task 绑定，不允许跨会话使用。
 - 审批消息展示 action 与 resources；如包含敏感内容，配置 `approvalChannel: "dm"`。
-- `permission.replied` 若由 TUI 触发（桥接未发起），标记 `REMOTE_HANDLED` 并在钉钉提示"已在本机处理"。
+- 同一审批单只认第一个决定：数据库层用 `UPDATE ... WHERE status='PENDING'` 抢占，失败即"已被处理"。
+- 弹窗同一审批项最多每 3 分钟弹一次，避免被关掉后反复骚扰。
 
 ### 8.3 超时与并发
 
@@ -1178,9 +1200,19 @@ permissions:
 | A-9 | `/experimental/session/{id}/wait` | ⚠️ 空闲时**立即 204**（2ms），有任务时阻塞到 idle（实测 1504ms）→ 只能作触发器 |
 | A-10 | `GET /session/{id}` | ✅ 返回 `outcome:"succeeded"`、`time.idle` |
 | A-11 | 钉钉 Stream 连接 | ✅ `connect success`——提供的 `clientId`/`clientSecret`/`robotCode` 有效（`dingapvpuh1glvotxjml`） |
-| A-12 | 钉钉消息回环 | ⏳ 未收到真实消息（探针 300s 内无消息投递），`senderStaffId` 等字段待真实消息验证 |
+| A-12 | 钉钉消息回环 | ✅ 真实消息收到（群 `opencode`，`conversationType=2`，`isInAtList=true`，`senderStaffId` 有值），sessionWebhook 回复成功 |
+| A-13 | 完整任务链路 | ✅ `PENDING → SUBMITTED → RUNNING → INTERRUPTED` 全程落库，outbox 逐条投递（accepted/started/approval/result 全部 SENT） |
+| A-14 | `PATCH /api/session/{id}` 改 permissions | ✅ 可运行中就地改策略（`session.permissions.synced`），无需 `/new` |
+| A-15 | `GET /message` 分页 | ⚠️ **`order=asc&limit=N` 只返回最早的 N 条**；且 **`cursor` 不能与 `order` 同时传**（"Cursor cannot be combined with order"）→ 必须先取 desc 最新页，再用 `cursor.previous` 回翻 |
+| A-16 | 审批多渠道 | ✅ Mac 原生对话框实测可用（`button returned:允许一次`），审批单抢占逻辑生效 |
+| A-17 | 权限预设热切换 | ✅ `default` 预设下 `shell` 不再触发审批 |
+| A-18 | Node 版本 | ⚠️ `@opencode/client` 的 SSE 读取依赖 `Promise.withResolvers`（Node 22+）；Node 20 需 polyfill（`src/polyfills.ts`） |
+| A-19 | 副作用观察 | ⚠️ 任务目标仓库是 bridge 自身时，`default` 预设下 agent **会直接改写 bridge 源码**（本次实测 agent 重构了 timeline.ts 并补齐了 limits/lock/heartbeat/retention 模块）→ **不要把 bridge 仓库设为默认项目** |
+| A-20 | 长时间任务 | ✅ 任务运行 14 分钟未结束时，bridge 保持 `RUNNING` 且不误判；心跳消息按 5 分钟间隔补充 |
 
 **结论：架构从"durable log 为主"改为"消息时间线为主 + 全局事件流加速 + 轮询兜底"（§5.5）。**
+
+**运维提醒**：默认项目**不要**指向 bridge 自身的仓库。`default` 放行预设下，远程消息等同于本机命令，agent 会直接改写该目录下的源码（本次实测即如此）。请把默认项目指向真正的业务仓库。
 
 ---
 
