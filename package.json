@@ -20,7 +20,9 @@
     "typecheck": "tsc --noEmit",
     "test:ask": "tsx scripts/test-ask.ts",
     "sessions": "tsx scripts/show-sessions.ts",
-    "test:task": "tsx scripts/test-task.ts"
+    "test:task": "tsx scripts/test-task.ts",
+    "test:unit": "tsx scripts/run-unit.ts",
+    "test": "npm run test:unit && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@opencode/client": "2.0.32",
