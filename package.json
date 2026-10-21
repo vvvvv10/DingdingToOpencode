@@ -19,7 +19,8 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "test:ask": "tsx scripts/test-ask.ts",
-    "sessions": "tsx scripts/show-sessions.ts"
+    "sessions": "tsx scripts/show-sessions.ts",
+    "test:task": "tsx scripts/test-task.ts"
   },
   "dependencies": {
     "@opencode/client": "2.0.32",

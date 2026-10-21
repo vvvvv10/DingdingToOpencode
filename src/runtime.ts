@@ -947,7 +947,22 @@ export class Bridge {
         if (active) continue // session busy: keep this task queued
         const session = getSession(this.db, sessionId)
         if (session && session.control_mode === "PAUSED") continue // human took over
-      } else {
+        // The conversation was rebound to another project: the old session
+        // still points at the previous directory, so it must not be reused.
+        if (session && session.project_alias !== task.project_alias) {
+          log.info("conversation.rebound", {
+            conversationId: task.conversation_id,
+            from: session.project_alias,
+            to: task.project_alias,
+            sessionId,
+          })
+          this.db
+            .prepare("UPDATE conversations SET active_session_id = NULL WHERE conversation_id = ?")
+            .run(task.conversation_id)
+          sessionId = undefined
+        }
+      }
+      if (!sessionId) {
         sessionId = await this.ensureSession(task, project, conversation.conversation_type)
         if (!sessionId) continue
       }
