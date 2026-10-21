@@ -4,6 +4,38 @@
 
 > 当前状态：**已跑通端到端，并已安装为开机自启的 LaunchAgent。**
 
+## 从零部署
+
+```sh
+git clone git@github.com:vvvvv10/DingdingToOpencode.git
+cd DingdingToOpencode
+npm install
+
+# 1) 钉钉凭证进 Keychain（不要写进仓库）
+security add-generic-password -U -a "$USER" -s opencode-dingtalk-client-secret -w '<clientSecret>'
+
+# 2) 配置：clientId / robotCode / 项目目录 / 群 ID / 用户 ID
+cp config/config.example.json config/config.json && $EDITOR config/config.json
+
+# 3) 装成开机自启（同时 build 出 dist/）
+npm run install:launchd
+
+# 4) 验证
+npm run test:unit      # 19 条离线单测
+npm run sessions       # 看看本机 OpenCode session
+launchctl print gui/$(id -u)/com.opencode.dingtalk-bridge
+```
+
+再在**全局**装两个 agent（bridge 的 session 建在项目目录里，agent 必须全局可见）：
+
+```
+~/.config/opencode/agents/dingtalk.md        # 执行任务
+~/.config/opencode/agents/dingtalk-chat.md   # 只读问答
+```
+
+> ⚠️ 源码目录**不要**放 `~/Desktop` / `~/Documents` / `~/Downloads`：macOS TCC 保护目录，
+> launchd 代理进程读不了（`open()` 永久阻塞）。任务**工作目录**可以放 Desktop。
+
 | 模块 | 状态 |
 |---|---|
 | 钉钉 Stream 接入 / ack / 去重 / sessionWebhook 回复 | ✅ |
