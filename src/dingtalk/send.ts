@@ -35,7 +35,16 @@ export class DingTalkSenderImpl {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ msgtype: "text", text: { content: text } }),
+    }).catch((error: Error) => {
+      // A dead webhook (DNS failure, refused connection) must fall through to
+      // the proactive path instead of failing the whole send.
+      this.opts.log.warn("dingtalk.webhook.error", {
+        conversationId: target.conversationId,
+        error: error.message,
+      })
+      return undefined
     })
+    if (!response) return false
     if (!response.ok) {
       this.opts.log.warn("dingtalk.webhook.failed", {
         conversationId: target.conversationId,
