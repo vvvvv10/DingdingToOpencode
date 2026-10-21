@@ -82,6 +82,9 @@ export function promptMessageId(taskId: string): string {
   return `msg_bridge_${taskId}`
 }
 
+/** Metadata sources the bridge stamps on its own prompts. */
+const BRIDGE_SOURCES = new Set(["dingtalk", "dingtalk-ask"])
+
 /** Read-only ruleset for `/ask` chat sessions. */
 const CHAT_PERMISSIONS = [
   { action: "read", resource: "*", effect: "allow" as const },
@@ -1517,7 +1520,10 @@ export class Bridge {
           if (type === "session.inbox.enqueued") {
             const item = data.item as { payload?: { metadata?: { source?: string } } } | undefined
             const source = item?.payload?.metadata?.source
-            if (source && source !== "dingtalk") {
+            // A prompt is "ours" only if it carries a bridge source marker.
+            // A prompt without metadata came from the TUI or another client:
+            // that IS human input and must be reported.
+            if (!BRIDGE_SOURCES.has(source ?? "")) {
               this.flagHumanIntervention(String(data.sessionID ?? ""))
             }
           }
@@ -1537,6 +1543,10 @@ export class Bridge {
   }
 
   private flagHumanIntervention(sessionId: string): void {
+    // Only the conversation's task session can be "taken over" by a human.
+    // Chat sessions (/ask) are bridge-only and are never flagged.
+    const session = getSession(this.db, sessionId)
+    if (!session) return
     const task = sessionTask(this.db, sessionId)
     if (!task) return
     if (task.human_intervened) return
