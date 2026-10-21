@@ -98,7 +98,14 @@ cp config/config.example.json config/config.json   # 然后按需修改
 - `projects[].alias` / `directory` / `allowedConversations` / `allowedUsers` / `approvers`
 - `projects[].permissionPreset`
 
-当前绑定：钉钉群「opencode」→ `tms-web` → `/Users/qianjiajie/tms/tms-web`。
+当前绑定：钉钉群「opencode」→ `opencode-todingding` → `/Users/qianjiajie/Desktop/opencodeTodingding`。
+
+> **为什么 bridge 源码不在 `~/Desktop`**：macOS 把 `~/Desktop`（以及 `~/Documents`、`~/Downloads`）列为 **TCC 保护目录**。launchd 拉起的代理进程**读不了**里面的文件——授权弹窗对 launchd 弹不出来，`open()` 会永久阻塞（实测：launchd 里跑 node 读 Desktop 直接卡死，手动跑则正常）。所以：
+>
+> - **bridge 源码 / 运行数据** → `~/opencodeTodingding`、`~/Library/Application Support/opencode-dingtalk-bridge`
+> - **任务工作目录** → 可以放在 `~/Desktop/...`，因为真正读写文件的是 **OpenCode 服务进程**（它从你的终端继承权限，实测能在 Desktop 建 session）
+>
+> 源码目录同理不要放 `~/Documents` / `~/Downloads`。
 
 ## 开发
 

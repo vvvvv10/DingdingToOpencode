@@ -1279,6 +1279,8 @@ permissions:
 | A-20 | 长时间任务 | ✅ 任务运行 14 分钟未结束时，bridge 保持 `RUNNING` 且不误判；心跳消息按 5 分钟间隔补充 |
 | A-21 | `/ask` 崩溃 | ❌→✅ 曾因 `chat_sessions` 表缺失（重构时 schema 改成版本化迁移，旧表没建）抛未捕获异常 → **进程直接崩溃** → launchd 重启 → in-flight 问答丢失。已修：① 迁移 v3 建表 ② 进程级 `unhandledRejection` / `uncaughtException` 兜底（**一个请求失败不能带走整个守护进程**）③ `/ask` 改走持久化任务管线，重启后仍能补发 |
 | A-22 | `/ask` 端到端 | ✅ 离线测试：只读 agent 16s 返回 `succeeded`，答案经 outbox 正确回传；`/ask 北京天气` 也能拿到实时数据 |
+| A-23 | **磁盘写满** | ❌→✅ `ENOSPC` 导致心跳写入失败并把进程带崩（`bridge.uncaught_exception`）。已修：心跳 flush 吞掉写失败（诊断文件永远不值得拖垮守护进程） |
+| A-24 | **launchd 读 `~/Desktop`** | ❌→✅ macOS TCC 保护目录：launchd 代理进程读 `~/Desktop` 下的文件会**永久阻塞**在 `open()`（授权弹窗对 launchd 弹不出来），而手动启动正常。实测探针确认。结论：**bridge 源码不能放 `~/Desktop`/`~/Documents`/`~/Downloads`**；任务工作目录可以（真正读写的是 OpenCode 服务进程，它从终端继承了权限） |
 
 **结论：架构从"durable log 为主"改为"消息时间线为主 + 全局事件流加速 + 轮询兜底"（§5.5）。**
 
