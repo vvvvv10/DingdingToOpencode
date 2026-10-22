@@ -59,6 +59,18 @@ launchctl print gui/$(id -u)/com.opencode.dingtalk-bridge
 | `/sessions` | **本机所有 OpenCode session 在干什么**（运行中/空闲、agent、项目、"正在跑什么"） |
 | `#approve A-7F3K` / `允许` / `拒绝` | 审批 |
 
+**别的 session 跑完也会通知你**（`notifyOtherSessions`，默认开）——你在别处开的 OpenCode session 结束时，钉钉会收到一条：
+
+```
+✅ OpenCode session 完成
+· 任务：在gateway-blueprint实现HRM UI技术方案
+· 目录：/Users/qianjiajie
+· agent：build
+· 摘要：找到根因了：flex 子项默认 min-width: auto …
+```
+
+桥接自己的 session 不走这条通道（它们本来就有任务回执）。通知走事件流 + 每分钟一次扫描兜底（事件流是 live-only，会丢）。
+
 `taskMode: "always"` 可以改回"每条消息都是任务"的旧行为，但那样群里一句闲聊就可能触发远程执行，不建议。
 
 ## 架构一句话

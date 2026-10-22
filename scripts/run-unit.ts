@@ -5,11 +5,12 @@
  */
 import { tests } from "../src/unit.test.js"
 import { tests as runtimeTests } from "../src/runtime.test.js"
+import { tests as notifyTests } from "../src/notify.test.js"
 
 let passed = 0
 const failures: Array<{ name: string; error: string }> = []
 
-const all = [...tests, ...runtimeTests]
+const all = [...tests, ...runtimeTests, ...notifyTests]
 
 for (const test of all) {
   try {

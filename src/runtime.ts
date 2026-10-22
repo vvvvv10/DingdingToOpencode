@@ -19,6 +19,7 @@ import { checkAdmission } from "./limits.js"
 import { connectOpenCode, OpenCodeUnavailableError } from "./opencode/client.js"
 import { fetchTurnWindow, waitForTurn } from "./opencode/timeline.js"
 import { showApprovalDialog } from "./approvals/mac-dialog.js"
+import { SessionNotifier } from "./notify.js"
 import { DingTalkAdapter, type DingTalkInbound } from "./dingtalk/adapter.js"
 import { DingTalkSenderImpl, type SendTarget } from "./dingtalk/send.js"
 import { Outbox } from "./outbox.js"
@@ -109,6 +110,8 @@ export class Bridge {
   private heartbeat: HeartbeatWriter | undefined
   /** approvalId -> last time a macOS dialog was shown for it. */
   private dialogShownAt = new Map<string, number>()
+  /** Notifications for sessions the bridge does not own. */
+  private notifier: SessionNotifier | undefined
   private running = false
   private lastRetentionAt = 0
 
@@ -134,6 +137,23 @@ export class Bridge {
         await this.adapter.reply(message, text)
       })
     this.heartbeat = opts.heartbeat
+
+    if (opts.config.bridge.notifyOtherSessions) {
+      const conversations =
+        opts.config.bridge.notifyConversations.length > 0
+          ? opts.config.bridge.notifyConversations
+          : opts.config.projects.flatMap((project) => project.allowedConversations)
+      this.notifier = new SessionNotifier({
+        client: this.client!,
+        db: opts.db,
+        log,
+        conversations,
+        minIntervalMs: opts.config.bridge.notifyMinIntervalMs,
+        deliver: ({ dedupeKey, conversationId, text }) => {
+          this.outbox.enqueue({ dedupeKey, conversationId, kind: "STATUS", text })
+        },
+      })
+    }
   }
 
   // ------------------------------------------------------------------ startup
@@ -1545,8 +1565,19 @@ export class Bridge {
           if (
             type === "session.execution.succeeded" ||
             type === "session.execution.failed" ||
-            type === "session.idle"
+            type === "session.execution.interrupted"
           ) {
+            void this.reconcile()
+            // Sessions the bridge does not own get a DingTalk notification.
+            const outcome =
+              type === "session.execution.succeeded"
+                ? "succeeded"
+                : type === "session.execution.failed"
+                  ? "failed"
+                  : "interrupted"
+            void this.notifier?.notifyFinished(String(data.sessionID ?? ""), outcome)
+          }
+          if (type === "session.idle") {
             void this.reconcile()
           }
         }
@@ -1611,6 +1642,8 @@ export class Bridge {
     while (this.running) {
       try {
         await this.runOnce()
+        // The event stream is live-only: sweep for completions it may have missed.
+        if (tick % 60 === 0) void this.notifier?.sweep()
         if (tick % 30 === 0 && this.outbox.pendingCount() > 0) {
           log.warn("outbox.backlog", { pending: this.outbox.pendingCount() })
         }

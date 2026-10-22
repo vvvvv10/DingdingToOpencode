@@ -99,6 +99,9 @@ launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST"
 
+sleep 1
+# Make sure the freshly loaded job is actually running.
+launchctl kickstart "$DOMAIN/$LABEL" 2>/dev/null || true
 sleep 2
 echo "installed: $PLIST"
 echo "node:     $NODE_BIN"

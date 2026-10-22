@@ -30,6 +30,9 @@ function makeConfig(dir: string): BridgeConfig {
       approvalChannel: "group",
       taskMode: "prefix",
       askEnabled: true,
+      notifyOtherSessions: false,
+      notifyConversations: [],
+      notifyMinIntervalMs: 60_000,
       logLevel: "error",
     },
     projects: [

@@ -77,6 +77,12 @@ const Config = z.object({
     taskMode: z.enum(["prefix", "always"]).default("prefix"),
     /** Enable `/ask <question>` (read-only agent session). */
     askEnabled: z.boolean().default(true),
+    /** Notify on DingTalk when a session the bridge does NOT own finishes. */
+    notifyOtherSessions: z.boolean().default(true),
+    /** Where those notifications go. Empty = the bound project conversations. */
+    notifyConversations: z.array(z.string()).default([]),
+    /** Minimum gap between two notifications for the same session. */
+    notifyMinIntervalMs: z.number().int().positive().default(60_000),
     logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
   }),
   projects: z.array(Project).min(1),

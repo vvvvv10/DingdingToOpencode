@@ -483,7 +483,18 @@ DELETE /api/session/{id}/inbox/{inboxID}         → client.session.inbox.cancel
 
 **`/ask` 为什么也走任务管线**：问答同样要落库（task 行）、同样靠时间线判定结束、同样经 outbox 投递。这样即使 bridge 在回答途中重启，答案仍会在恢复后送达，而不是随进程一起消失。`kind` 字段区分两者（迁移 v3）。
 
-### 6.8 观察本机其它 session
+### 6.8 通知：别的 session 跑完时 ping 一下
+
+用户常常同时开着多个 OpenCode session（别的 TUI 标签页、别的项目），不可能一直盯着终端。桥接因此对**自己之外的** session 完成后发一条钉钉通知。
+
+- **触发**：全局事件流里的 `session.execution.succeeded|failed|interrupted`（秒级）。
+- **兜底**：事件流是 live-only 会丢事件，所以每 60s 扫一次最近更新的 session（看 `time.idle`），靠 idle 时间戳去重。
+- **去重键**：`notify:<sessionID>:<idleTs>:<conversationID>`，写进 outbox 的唯一索引 → 事件路径与扫描路径不会重复发。
+- **排除**：桥接自己的 task session 与 chat session 走任务回执，不重复通知。
+- **内容**：标题、目录、agent、最后一段助手输出摘要（≤300 字）。
+- **开关**：`bridge.notifyOtherSessions`（默认开）、`bridge.notifyConversations`（默认=绑定的群）、`bridge.notifyMinIntervalMs`（默认 60s）。
+
+### 6.9 观察本机其它 session
 
 TUI 一次只能看一个 session，"其它 session 在干什么"没有内置入口。桥接补上这个视角：
 
